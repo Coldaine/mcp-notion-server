@@ -90,26 +90,27 @@ async function cacheImage(imageBlock) {
 
 ### 3. Rate Limits: 3 Requests/Second ⏱️
 
-**Problem:** Official limit is 3 req/sec average (2,700 per 15 min), restrictive for bulk operations.
+**Problem:** Official limit is 3 req/sec average, can be hit during bulk operations.
 
 **Impact:**
-- Nested block fetching hits limits quickly
-- Bulk database queries require careful throttling
+- Nested block fetching can hit limits with deep structures
+- Large-scale sync operations may encounter 429 errors
 - HTTP 429 errors with `rate_limited` code
 
 **Official Limits:**
-- Average: 3 requests/second per integration
-- Window: 15 minutes (2,700 requests)
-- Bursts allowed but short-term
+- **Average:** 3 requests/second per integration token
+- **Same across ALL tiers:** Free, Plus, Business, Enterprise (no difference)
+- **Bursts allowed:** Occasional spikes above 3/sec are permitted
+- **Error handling:** HTTP 429 with `Retry-After` header (integer seconds)
 
 **Workaround:**
-- Implement request queue with throttling
-- Exponential backoff on 429 errors
-- Batch operations where possible
+- **For typical MCP usage:** Handle 429 reactively with `Retry-After` header (no proactive throttling needed)
+- **For bulk operations only:** Optional light throttling (~2.5 req/sec)
+- Batch operations where possible (more important than throttling)
 - Cache aggressively
 
 **Implementation:**
-See [rate-limiting.md](./rate-limiting.md) for detailed strategies.
+See [rate-limiting.md](./rate-limiting.md) for detailed strategies - focuses on reactive handling rather than aggressive throttling.
 
 ### 4. Pagination Issues 📄
 

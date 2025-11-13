@@ -299,16 +299,67 @@ await client.updateDatabase(
 
 ## Rate Limiting Implementation
 
-### Basic Throttling
+### Reactive Handling (Recommended)
+
+**For typical MCP usage**, use reactive 429 handling instead of proactive throttling:
 
 ```javascript
-class ThrottledNotionClient extends NotionClientWrapper {
-  constructor(token, requestsPerSecond = 2) {
+class NotionClientWithRetry extends NotionClientWrapper {
+  constructor(token, maxRetries = 3) {
     super(token);
+    this.maxRetries = maxRetries;
+  }
+
+  async requestWithRetry(fn) {
+    let attempt = 0;
+
+    while (attempt < this.maxRetries) {
+      try {
+        return await fn();
+      } catch (error) {
+        // Only retry on rate limit errors
+        if (error.status !== 429 || attempt >= this.maxRetries - 1) {
+          throw error;
+        }
+
+        // Prefer Retry-After header, fallback to exponential backoff
+        const retryAfter = error.headers?.get('Retry-After');
+        const waitSeconds = retryAfter ? parseInt(retryAfter) : Math.pow(2, attempt + 1);
+
+        console.warn(`Rate limited (429). Waiting ${waitSeconds}s... (attempt ${attempt + 1}/${this.maxRetries})`);
+
+        await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+        attempt++;
+      }
+    }
+
+    throw new Error('Max retries exceeded');
+  }
+
+  // Override methods to use retry logic
+  async retrievePage(pageId) {
+    return this.requestWithRetry(() => super.retrievePage(pageId));
+  }
+
+  async queryDatabase(databaseId, filter, sorts, cursor, pageSize) {
+    return this.requestWithRetry(() =>
+      super.queryDatabase(databaseId, filter, sorts, cursor, pageSize)
+    );
+  }
+
+  // ... override other methods
+}
+```
+
+### Optional Throttling (Bulk Operations Only)
+
+**Only needed for sustained bulk operations** (100+ requests):
+
+```javascript
+class OptionalThrottling {
+  constructor(requestsPerSecond = 2.5) {
     this.interval = 1000 / requestsPerSecond;
     this.lastRequest = 0;
-    this.queue = [];
-    this.processing = false;
   }
 
   async throttle() {
@@ -322,58 +373,20 @@ class ThrottledNotionClient extends NotionClientWrapper {
 
     this.lastRequest = Date.now();
   }
+}
 
-  async request(method, ...args) {
-    await this.throttle();
-    return super[method](...args);
+// Usage - only for bulk operations
+const limiter = new OptionalThrottling(2.5);
+
+async function syncManyPages(pageIds) {
+  for (const pageId of pageIds) {
+    await limiter.throttle();  // Only throttle in bulk operations
+    await client.retrievePage(pageId);
   }
-
-  // Override all methods to use throttling
-  async retrievePage(pageId) {
-    return this.request('retrievePage', pageId);
-  }
-
-  async queryDatabase(databaseId, filter, sorts, cursor, pageSize) {
-    return this.request('queryDatabase', databaseId, filter, sorts, cursor, pageSize);
-  }
-
-  // ... override other methods
 }
 ```
 
-### Retry Logic with Exponential Backoff
-
-```javascript
-async function withRetry(fn, maxRetries = 4) {
-  let attempt = 0;
-
-  while (attempt < maxRetries) {
-    try {
-      return await fn();
-    } catch (error) {
-      // Only retry on rate limit errors
-      if (error.status !== 429 || attempt >= maxRetries - 1) {
-        throw error;
-      }
-
-      // Exponential backoff with jitter
-      const baseDelay = Math.pow(2, attempt + 1) * 1000;
-      const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
-      const delay = baseDelay + jitter;
-
-      console.warn(`Rate limited (429). Retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
-
-      await new Promise(resolve => setTimeout(resolve, delay));
-      attempt++;
-    }
-  }
-
-  throw new Error('Max retries exceeded');
-}
-
-// Usage
-const page = await withRetry(() => client.retrievePage(pageId));
-```
+**Note:** Notion's rate limit is an **average** of 3 req/sec with bursts allowed. For typical MCP usage (single requests), reactive handling is sufficient.
 
 ---
 
@@ -683,16 +696,18 @@ app.get('/metrics', async (req, res) => {
 
 ## Best Practices Summary
 
-1. **Always throttle proactively** - Don't wait for 429s
-2. **Implement exponential backoff** - Handle rate limits gracefully
-3. **Cache aggressively** - Block IDs are stable
+1. **Handle 429 reactively** - Use `Retry-After` header, don't throttle everything
+2. **Batch operations** - Append 100 blocks at once, not one-by-one
+3. **Cache aggressively** - Block IDs are stable, cache by ID
 4. **Validate input** - Check IDs, property names, etc.
 5. **Log comprehensively** - Track API calls, errors, rate limits
 6. **Handle pagination** - Validate cursors, implement safety limits
 7. **Test thoroughly** - Unit tests + integration tests against real API
-8. **Monitor in production** - Track metrics, alerts for rate limits
+8. **Monitor in production** - Track 429 frequency to decide if throttling is needed
 9. **Use TypeScript** - Type safety prevents many errors
 10. **Document your schema** - Keep track of database properties and types
+
+**Rate Limiting Philosophy:** Notion allows bursts above the 3 req/sec average. For typical MCP usage, reactive 429 handling is sufficient. Only add proactive throttling if monitoring shows frequent rate limiting.
 
 ---
 

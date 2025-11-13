@@ -25,10 +25,10 @@ Each tool uses an `operation` parameter to specify the desired action, following
 
 ## Key Features
 
-- **Unified API** - Consolidated from 18 individual tools to 6 resource-based tools
-- **Rate Limiting** - Built-in throttling and exponential backoff for 429 errors
-- **Pagination** - Automatic cursor handling for large result sets
-- **Error Handling** - Comprehensive error recovery and retry logic
+- **Complete API Coverage** - All 20 Notion API endpoints supported
+- **Missing Endpoints Added** - Create page, retrieve page property item now available
+- **Smart Error Handling** - Reactive 429 handling with Retry-After header support
+- **Pagination** - Cursor handling for large result sets
 - **Format Options** - JSON or Markdown output formats
 
 ## Requirements
@@ -71,12 +71,11 @@ The server implements the Model Context Protocol (MCP) specification, providing:
 
 ## Rate Limits
 
-Notion API enforces an average of **3 requests per second** per integration (2,700 per 15 minutes). The server implements:
-- Automatic throttling
-- Exponential backoff on 429 errors
-- Retry logic with jitter
+Notion API enforces an average of **3 requests per second** per integration token (applies to ALL tiers - Free, Plus, Business, Enterprise). Bursts above this average are allowed.
 
-See [rate-limiting.md](./rate-limiting.md) for detailed strategies.
+**For typical MCP usage**, no proactive throttling is needed. The implementation handles 429 errors reactively using the `Retry-After` header.
+
+See [rate-limiting.md](./rate-limiting.md) for detailed strategies and when throttling may be needed (bulk operations only).
 
 ## Common Patterns
 

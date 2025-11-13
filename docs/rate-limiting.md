@@ -2,31 +2,81 @@
 
 This document covers Notion API rate limits, implementation strategies, and best practices for handling 429 errors.
 
-## Official Limits
+## Official Limits (All Tiers)
 
 **Notion API Rate Limit:**
-- **Average:** 3 requests per second per integration
-- **Burst Window:** 15 minutes (2,700 requests total)
+- **Average:** 3 requests per second per integration token
+- **Applies to:** ALL pricing tiers (Free, Plus, Business, Enterprise) - no difference
+- **Bursts allowed:** Yes - occasional spikes above 3/sec are permitted
 - **HTTP Error:** 429 with `rate_limited` error code
-- **Response Header:** `retry-after` (seconds to wait)
+- **Response Header:** `Retry-After` (integer seconds to wait)
 
 **Key Points:**
-- Limit is per integration token, not per user
-- Short bursts allowed (can exceed 3/sec briefly)
-- Sustained load must stay under 3/sec average
-- Exceeding limit returns 429, not request drop
+- Limit is per integration token, not per user or workspace
+- It's an **average** of 3/sec - bursts beyond this are allowed
+- Future: Notion may introduce tier-based limits, but currently all tiers are the same
+- Best practice: Handle 429 responses reactively rather than throttling everything
 
 ## Rate Limit Strategy
 
-### 1. Proactive Throttling
+### Recommended Approach: Reactive Handling (Not Proactive Throttling)
 
-**Don't wait for 429s** - throttle requests proactively to stay under limit.
+**For typical MCP usage** (single requests from Claude), you **don't need proactive throttling**. The official docs allow bursts, and normal usage won't hit limits.
 
-**Implementation:**
+**When you DO need rate limiting:**
+- Bulk sync operations
+- Recursive nested block fetching
+- Large-scale automation (>3 req/sec sustained)
+
+### 1. Reactive Handling (Recommended for Most Use Cases)
+
+**Handle 429 errors when they occur** using the `Retry-After` header:
+
 ```javascript
-class RateLimiter {
-  constructor(requestsPerSecond = 3) {
-    this.interval = 1000 / requestsPerSecond;  // ~333ms between requests
+async function notionRequest(url, options, maxRetries = 3) {
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      const response = await fetch(url, options);
+
+      // Check for rate limit
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const waitSeconds = retryAfter ? parseInt(retryAfter) : Math.pow(2, attempt);
+
+        console.warn(`Rate limited (429). Waiting ${waitSeconds}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+
+        attempt++;
+        continue;
+      }
+
+      // Success or non-retryable error
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      return await response.json();
+
+    } catch (error) {
+      if (attempt >= maxRetries - 1) throw error;
+      attempt++;
+    }
+  }
+
+  throw new Error('Max retries exceeded');
+}
+```
+
+### 2. Optional Proactive Throttling (For Bulk Operations Only)
+
+**Only use this for known bulk operations** (e.g., syncing entire workspace):
+
+```javascript
+class OptionalRateLimiter {
+  constructor(requestsPerSecond = 2.5) {
+    this.interval = 1000 / requestsPerSecond;  // ~400ms between requests
     this.lastRequest = 0;
   }
 
@@ -43,49 +93,47 @@ class RateLimiter {
   }
 }
 
-// Usage
-const limiter = new RateLimiter(3);
+// Usage - only for bulk operations
+const limiter = new OptionalRateLimiter(2.5);  // Slightly under limit for safety
 
-async function makeRequest(url, options) {
-  await limiter.throttle();
-  return fetch(url, options);
+async function bulkSync() {
+  for (const pageId of manyPageIds) {
+    await limiter.throttle();  // Only throttle in bulk operations
+    await client.retrievePage(pageId);
+  }
 }
 ```
 
-**Conservative Approach (Recommended for Edit Operations):**
+### 3. Exponential Backoff (Fallback Only)
+
+Use exponential backoff **only if `Retry-After` header is missing**:
+
 ```javascript
-// Use 2 req/sec for safety margin on writes
-const limiter = new RateLimiter(2);  // 500ms between requests
-```
-
-### 2. Exponential Backoff with Jitter
-
-When 429 errors occur, retry with exponential backoff and jitter to avoid thundering herd.
-
-**Implementation:**
-```javascript
-async function retryWithBackoff(fn, maxRetries = 4) {
+async function retryWithBackoff(fn, maxRetries = 3) {
   let attempt = 0;
 
   while (attempt < maxRetries) {
     try {
       return await fn();
     } catch (error) {
-      // Check if it's a rate limit error
+      // Only retry on rate limit errors
       if (error.status !== 429 || attempt >= maxRetries - 1) {
         throw error;
       }
 
-      // Exponential backoff: 2s, 4s, 8s, 16s
-      const baseDelay = Math.pow(2, attempt + 1) * 1000;
+      // Prefer Retry-After header, fallback to exponential backoff
+      const retryAfter = error.headers?.get('Retry-After');
+      const baseDelay = retryAfter
+        ? parseInt(retryAfter) * 1000
+        : Math.pow(2, attempt + 1) * 1000;  // 2s, 4s, 8s
 
-      // Add jitter: ±25% randomness
-      const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
-      const delay = baseDelay + jitter;
+      // Add small jitter to avoid thundering herd (±10%)
+      const jitter = baseDelay * 0.1 * (Math.random() * 2 - 1);
+      const finalDelay = baseDelay + jitter;
 
-      console.warn(`Rate limited (429). Retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
+      console.warn(`Rate limited (429). Retrying in ${Math.round(finalDelay/1000)}s... (attempt ${attempt + 1}/${maxRetries})`);
 
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await new Promise(resolve => setTimeout(resolve, finalDelay));
       attempt++;
     }
   }
@@ -95,46 +143,13 @@ async function retryWithBackoff(fn, maxRetries = 4) {
 
 // Usage
 const result = await retryWithBackoff(async () => {
-  return await notionClient.pages.retrieve({ page_id: "abc123" });
+  return await notionClient.retrievePage("page-id");
 });
 ```
 
-**Use `retry-after` Header (Preferred):**
-```javascript
-async function retryWithBackoff(fn, maxRetries = 4) {
-  let attempt = 0;
+### 4. Request Queue with Concurrency Limit (Optional for Bulk Operations)
 
-  while (attempt < maxRetries) {
-    try {
-      return await fn();
-    } catch (error) {
-      if (error.status !== 429 || attempt >= maxRetries - 1) {
-        throw error;
-      }
-
-      // Use retry-after header if available, otherwise exponential backoff
-      const retryAfter = error.headers?.get('retry-after');
-      const delay = retryAfter
-        ? parseInt(retryAfter) * 1000
-        : Math.pow(2, attempt + 1) * 1000;
-
-      const jitter = delay * 0.25 * (Math.random() * 2 - 1);
-      const finalDelay = delay + jitter;
-
-      console.warn(`Rate limited. Retrying in ${finalDelay}ms...`);
-
-      await new Promise(resolve => setTimeout(resolve, finalDelay));
-      attempt++;
-    }
-  }
-
-  throw new Error("Max retries exceeded");
-}
-```
-
-### 3. Request Queue with Concurrency Limit
-
-For bulk operations, use a queue to control concurrency and prevent rate limit bursts.
+**Only needed for sustained bulk operations** (not typical MCP usage):
 
 **Implementation with p-queue:**
 ```javascript
@@ -215,9 +230,9 @@ const results = await Promise.all([
 ]);
 ```
 
-### 4. Batch Operations
+### 5. Batch Operations (Always Recommended)
 
-Group operations to minimize API calls where possible.
+Group operations to minimize API calls where possible - **this is more important than rate limiting**:
 
 **Append Multiple Blocks:**
 ```javascript
@@ -254,15 +269,15 @@ const pages = await Promise.all(
 );
 ```
 
-## Complete Integration
+## Complete Integration (Simplified - Reactive Approach)
 
-Combine all strategies into a production-ready client wrapper:
+**For typical MCP usage**, use a simple reactive approach:
 
 ```javascript
 import fetch from 'node-fetch';
 
-class NotionClientWithRateLimiting {
-  constructor(token, requestsPerSecond = 2) {
+class NotionClientSimple {
+  constructor(token) {
     this.token = token;
     this.baseUrl = 'https://api.notion.com/v1';
     this.headers = {
@@ -270,88 +285,46 @@ class NotionClientWithRateLimiting {
       'Content-Type': 'application/json',
       'Notion-Version': '2022-06-28'
     };
-
-    // Rate limiting
-    this.interval = 1000 / requestsPerSecond;
-    this.lastRequest = 0;
-    this.queue = [];
-    this.processing = false;
   }
 
-  async request(endpoint, options = {}, maxRetries = 4) {
-    return this.enqueue(async () => {
-      return this.executeWithRetry(endpoint, options, maxRetries);
-    });
-  }
-
-  async enqueue(fn) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
-      this.processQueue();
-    });
-  }
-
-  async processQueue() {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
-
-    while (this.queue.length > 0) {
-      const { fn, resolve, reject } = this.queue.shift();
-
-      try {
-        const result = await fn();
-        resolve(result);
-      } catch (error) {
-        reject(error);
-      }
-    }
-
-    this.processing = false;
-  }
-
-  async executeWithRetry(endpoint, options, maxRetries) {
+  async request(endpoint, options = {}, maxRetries = 3) {
     let attempt = 0;
 
     while (attempt < maxRetries) {
-      // Throttle
-      await this.throttle();
-
       try {
         const response = await fetch(`${this.baseUrl}${endpoint}`, {
           ...options,
           headers: { ...this.headers, ...options.headers }
         });
 
-        // Check for rate limit
+        // Handle rate limiting
         if (response.status === 429) {
-          const retryAfter = response.headers.get('retry-after');
-          const delay = retryAfter
-            ? parseInt(retryAfter) * 1000
-            : Math.pow(2, attempt + 1) * 1000;
-
-          const jitter = delay * 0.25 * (Math.random() * 2 - 1);
-          const finalDelay = delay + jitter;
+          const retryAfter = response.headers.get('Retry-After');
+          const waitSeconds = retryAfter ? parseInt(retryAfter) : Math.pow(2, attempt + 1);
 
           if (attempt < maxRetries - 1) {
-            console.warn(`Rate limited (429). Retrying in ${finalDelay}ms... (attempt ${attempt + 1}/${maxRetries})`);
-            await new Promise(resolve => setTimeout(resolve, finalDelay));
+            console.warn(`Rate limited (429). Waiting ${waitSeconds}s... (attempt ${attempt + 1}/${maxRetries})`);
+            await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
             attempt++;
             continue;
           }
         }
 
-        // Success or non-retryable error
+        // Parse response
         const data = await response.json();
 
         if (!response.ok) {
-          throw new Error(`Notion API error: ${data.message || response.statusText}`);
+          const error = new Error(data.message || response.statusText);
+          error.status = response.status;
+          error.code = data.code;
+          throw error;
         }
 
         return data;
 
       } catch (error) {
-        // Network errors - retry with backoff
-        if (attempt < maxRetries - 1 && !error.message.includes('Notion API error')) {
+        // Retry network errors, but not API errors
+        if (attempt < maxRetries - 1 && !error.status) {
           const delay = Math.pow(2, attempt + 1) * 1000;
           console.warn(`Network error. Retrying in ${delay}ms...`);
           await new Promise(resolve => setTimeout(resolve, delay));
@@ -366,18 +339,6 @@ class NotionClientWithRateLimiting {
     throw new Error('Max retries exceeded');
   }
 
-  async throttle() {
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequest;
-    const waitTime = Math.max(0, this.interval - timeSinceLastRequest);
-
-    if (waitTime > 0) {
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-    }
-
-    this.lastRequest = Date.now();
-  }
-
   // API methods
   async retrievePage(pageId) {
     return this.request(`/pages/${pageId}`, { method: 'GET' });
@@ -389,54 +350,56 @@ class NotionClientWithRateLimiting {
       body: JSON.stringify({ filter, sorts, start_cursor: startCursor, page_size: pageSize })
     });
   }
-
-  // ... other methods
 }
 
-// Usage
-const client = new NotionClientWithRateLimiting(process.env.NOTION_API_TOKEN, 2);
-
-// Automatically throttled and retried
+// Usage - no throttling needed for normal MCP usage
+const client = new NotionClientSimple(process.env.NOTION_API_TOKEN);
 const page = await client.retrievePage('abc123');
 ```
 
 ## Best Practices Summary
 
-1. **Throttle Proactively**
-   - Use 2-2.5 req/sec for safety margin
-   - Especially important for write operations
-   - Prevents hitting rate limits in first place
+### For Typical MCP Usage (Single Requests)
 
-2. **Implement Exponential Backoff**
-   - Handle 429s gracefully with retry logic
-   - Use `retry-after` header when available
-   - Add jitter to prevent thundering herd
-   - Max 4 retries: 2s, 4s, 8s, 16s
+1. **Use Reactive Handling (Not Proactive Throttling)**
+   - Handle 429 errors when they occur
+   - Respect `Retry-After` header
+   - Don't slow down normal requests with throttling
 
-3. **Use Request Queue**
-   - Control concurrency for bulk operations
-   - Prevents bursts that trigger rate limits
-   - Better resource utilization
+2. **Implement Simple Retry Logic**
+   - Max 3 retries with exponential backoff fallback
+   - Use `Retry-After` header when available
+   - Small jitter (±10%) to avoid thundering herd
 
-4. **Batch Where Possible**
+3. **Batch Where Possible**
    - Append multiple blocks in one call (max 100)
-   - Parallel fetches with throttling
-   - Reduce total API call count
+   - Reduces total API calls more than throttling helps
+   - This is the #1 optimization
 
-5. **Monitor and Log**
-   - Track 429 frequency
-   - Log retry attempts
-   - Alert on excessive rate limiting
-
-6. **Cache Aggressively**
+4. **Cache Aggressively**
    - Block IDs are stable - cache by ID
    - Invalidate on updates
-   - Reduces API load significantly
+   - Reduces API load more than any rate limiting strategy
+
+### For Bulk Operations Only
+
+5. **Optional Light Throttling**
+   - Use ~2.5 req/sec for sustained bulk operations
+   - Only when doing 100+ requests in succession
+   - Not needed for typical MCP usage
+
+6. **Monitor 429 Frequency**
+   - If you see many 429s, then consider throttling
+   - If you rarely see 429s, don't throttle
 
 7. **Optimize Nested Fetches**
    - Fetch only necessary depth
    - Use `has_children` to skip unnecessary calls
    - Consider lazy loading for deep structures
+
+### Key Insight
+
+**Bursts are allowed** - the limit is an average of 3/sec, not a hard cap. Occasional spikes are fine. Don't prematurely optimize with aggressive throttling.
 
 ## Monitoring Example
 
